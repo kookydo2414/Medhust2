@@ -18,6 +18,54 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 0.5 إخفاء نافذة hosted-compute-agent (إغلاقها بالخطأ يقتل البيئة)
+      - name: Hide GitHub Agent Console
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $HiderPath = 'C:\ProgramData\hide_agent.ps1'
+          @'
+          $src = @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public class WinHider {
+              delegate bool EnumProc(IntPtr h, IntPtr l);
+              [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc p, IntPtr l);
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+              [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+              [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
+              public static void Apply(bool show) {
+                  EnumWindows(delegate(IntPtr h, IntPtr l) {
+                      StringBuilder t = new StringBuilder(512);
+                      StringBuilder c = new StringBuilder(256);
+                      GetWindowText(h, t, 512);
+                      GetClassName(h, c, 256);
+                      string title = t.ToString();
+                      string cls = c.ToString();
+                      bool isConsole = (cls == "ConsoleWindowClass" || cls == "CASCADIA_HOSTING_WINDOW_CLASS");
+                      bool isAgent = title.IndexOf("hosted-compute-agent", StringComparison.OrdinalIgnoreCase) >= 0;
+                      if (isConsole && isAgent) {
+                          bool vis = IsWindowVisible(h);
+                          if (show && !vis) ShowWindow(h, 5);
+                          else if (!show && vis) ShowWindow(h, 0);
+                      }
+                      return true;
+                  }, IntPtr.Zero);
+              }
+          }
+          "@
+          Add-Type -TypeDefinition $src
+          while ($true) {
+              try { [WinHider]::Apply((Test-Path 'C:\show_agent.txt')) } catch {}
+              Start-Sleep -Seconds 1
+          }
+          '@ | Set-Content -Path $HiderPath -Encoding UTF8
+          Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $HiderPath
+          Start-Sleep -Seconds 5
+          Write-Host "Agent console hider started (create C:\show_agent.txt to show the window again)."
+
       # 1. إعداد النظام، المستخدمين، RDP (على شبكة Tailscale فقط)، وتغيير دقة الشاشة
       - name: System, RDP & Display Setup
         continue-on-error: true
