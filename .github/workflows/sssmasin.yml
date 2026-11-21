@@ -1,4 +1,4 @@
-name: AA_Tsdsdsin 11
+name: AA_T121Win 11
 on:
   workflow_dispatch:
 
@@ -77,6 +77,34 @@ jobs:
           $TempDir = Join-Path $env:TEMP 'AppBundle'
           New-Item -Path $TempDir -ItemType Directory -Force | Out-Null
           $BundleZip = Join-Path $env:TEMP 'app_bundle.zip'
+          # دالة فك ضغط آمنة (Expand-Archive في PowerShell 7 يرفض zip الخاص بـ Dropbox)
+          $HelperPath = Join-Path $env:TEMP 'Expand-Safe.ps1'
+          @'
+          function Expand-Safe([string]$Zip, [string]$Dest) {
+              New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+              $sz = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+              if (Test-Path $sz) {
+                  & $sz x $Zip "-o$Dest" -y -aoa | Out-Null
+                  if ($LASTEXITCODE -le 1) { return }
+                  Write-Host "7-Zip exit code $LASTEXITCODE, trying .NET fallback..."
+              }
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              $destFull = [IO.Path]::GetFullPath($Dest)
+              $archive = [IO.Compression.ZipFile]::OpenRead($Zip)
+              try {
+                  foreach ($e in $archive.Entries) {
+                      $rel = ($e.FullName -replace '\\', '/').TrimStart('/')
+                      $parts = @($rel.Split('/') | Where-Object { $_ -and $_ -ne '.' -and $_ -ne '..' })
+                      if ($parts.Count -eq 0) { continue }
+                      $target = Join-Path $destFull ($parts -join '\')
+                      if ($rel.EndsWith('/')) { New-Item -ItemType Directory -Force -Path $target | Out-Null; continue }
+                      New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
+                      [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+                  }
+              } finally { $archive.Dispose() }
+          }
+          '@ | Set-Content -Path $HelperPath -Encoding UTF8
+          . $HelperPath
           $Success = $false
           try {
               $LinksText = Invoke-RestMethod -Uri $env:LINKS_LIST_URL
@@ -89,7 +117,7 @@ jobs:
               try {
                   Write-Host "Trying Bundle Link: $Url"
                   Invoke-WebRequest -Uri $Url -OutFile $BundleZip -UseBasicParsing -ErrorAction Stop -TimeoutSec 180
-                  Expand-Archive -Path $BundleZip -DestinationPath $TempDir -Force -ErrorAction Stop
+                  Expand-Safe $BundleZip $TempDir
                   $Success = $true; break
               } catch {
                   Write-Host "Link failed/corrupted: $($_.Exception.Message). Moving to next..."
@@ -409,6 +437,8 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
+          $HelperPath = Join-Path $env:TEMP 'Expand-Safe.ps1'
+          if (Test-Path $HelperPath) { . $HelperPath } else { function Expand-Safe([string]$Zip, [string]$Dest) { Expand-Archive -Path $Zip -DestinationPath $Dest -Force } }
           $BundleDir = Join-Path $env:TEMP 'AppBundle'
           $DesktopPath = Join-Path $env:USERPROFILE 'Desktop'
           function Download-And-Verify($TxtFile, $DestPath) {
@@ -419,7 +449,7 @@ jobs:
                       try {
                           Invoke-WebRequest -Uri $Url -OutFile $TempZip -UseBasicParsing -ErrorAction Stop -TimeoutSec 120
                           New-Item -Path $DestPath -ItemType Directory -Force | Out-Null
-                          Expand-Archive -Path $TempZip -DestinationPath $DestPath -Force -ErrorAction Stop
+                          Expand-Safe $TempZip $DestPath
                           Remove-Item $TempZip -Force
                           return $true
                       } catch { if (Test-Path $TempZip) { Remove-Item $TempZip -Force } }
@@ -445,6 +475,8 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
+          $HelperPath = Join-Path $env:TEMP 'Expand-Safe.ps1'
+          if (Test-Path $HelperPath) { . $HelperPath } else { function Expand-Safe([string]$Zip, [string]$Dest) { Expand-Archive -Path $Zip -DestinationPath $Dest -Force } }
           $BundleDir = Join-Path $env:TEMP 'AppBundle'
           $ThreeDir = Join-Path $env:TEMP 'THREE_EXTRACTED'
           
@@ -480,7 +512,7 @@ jobs:
               if ($NstK) {
                   $NstDest = "C:\Users\runneradmin\.nst-agent\download\kernels\nstchrome"
                   New-Item -ItemType Directory -Path $NstDest -Force | Out-Null
-                  Expand-Archive -Path $NstK.FullName -DestinationPath $NstDest -Force
+                  Expand-Safe $NstK.FullName $NstDest
               }
           } 
 
@@ -492,7 +524,7 @@ jobs:
               if ($BitK) {
                   $BitDest = "C:\Users\runneradmin\AppData\Roaming\BitBrowser\Chrome-bin"
                   New-Item -ItemType Directory -Path $BitDest -Force | Out-Null
-                  Expand-Archive -Path $BitK.FullName -DestinationPath $BitDest -Force
+                  Expand-Safe $BitK.FullName $BitDest
               }
           } 
 
