@@ -4,7 +4,7 @@ on:
 
 jobs:
   deployment:
-    runs-on: windows-2022
+    windows-latest
     timeout-minutes: 800
     env:
       TIME_JOB: "340"
