@@ -1,44 +1,51 @@
-name: 1AA_Test_Win 11
+name: AA_Testcc_Win 11
 on:
   workflow_dispatch:
 
 jobs:
   deployment:
-    runs-on: windows-latest
-    timeout-minutes: 360
+    runs-on: windows-2022
+    timeout-minutes: 360          # حد GitHub الأقصى لأي job هو 360 دقيقة
+    defaults:
+      run:
+        shell: pwsh
     env:
-      TIME_JOB: "340"
-      aa2: "XCDOOD"
-      aa3: "Zxxz4444"
-      LINKS_LIST_URL: "https://tinyurl.com/ddaS441581"
-      KEY_CHOICE: "1"
-      PYTHONIOENCODING: "utf-8"
-      TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      # ===================== عدّل هذه القيم فقط =====================
+      TS_AUTHKEY: "tskey-auth-PUT_YOUR_KEY_HERE"   # مفتاح Tailscale (يُفضّل Reusable + Ephemeral)
+      aa2: "PUT_WINDOWS_USERNAME"                  # اسم مستخدم ويندوز الجديد
+      aa3: "PUT_STRONG_PASSWORD_12CHARS"           # كلمة سر ويندوز + RustDesk (12 حرف أو أكثر، بلا مسافات)
+      TIME_JOB: "330"                              # مدة الجلسة بالدقائق (لا تتجاوز 340)
+      LINKS_LIST_URL: "https://tinyurl.com/ddaS441581"   # رابط حزمة NST/BitBrowser/NoMachine
+      KEY_CHOICE: "1"                              # احتياطي: يُستخدم key1.txt من الحزمة لو TS_AUTHKEY فارغ
+      # ==============================================================
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      # 0. فحص القيم قبل البدء
+      - name: Validate settings
+        run: |
+          if ($env:aa3.Length -lt 12 -or $env:aa3 -match '\s') { throw 'aa3 must be at least 12 chars with no spaces.' }
+          if ($env:aa2 -like 'PUT_*') { throw 'Edit aa2 (username) in the env block.' }
+          if ($env:TS_AUTHKEY -like '*PUT_YOUR_KEY*') { Write-Warning 'TS_AUTHKEY not set; will try key file from the bundle.' }
+          Write-Host "::add-mask::$env:aa3"
+          Write-Host "::add-mask::$env:TS_AUTHKEY"
 
-      # 1. إعداد النظام، المستخدمين، وتغيير دقة الشاشة (بدون تغيير)
+      # 1. إعداد النظام والمستخدمين والدقة
       - name: System, RDP & Display Setup
         continue-on-error: true
-        shell: pwsh
         run: |
           Write-Host "==== 1. CONFIGURING RDP, USERS & DISPLAY ===="
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0 -Force
           netsh advfirewall firewall set rule group="Remote Desktop" new enable=Yes
 
-          $Pass = $env:aa3
-          $Secure = ConvertTo-SecureString $Pass -AsPlainText -Force
+          $Secure = ConvertTo-SecureString $env:aa3 -AsPlainText -Force
           Set-LocalUser -Name "runneradmin" -Password $Secure
           if (-not (Get-LocalUser -Name $env:aa2 -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name $env:aa2 -Password $Secure -AccountNeverExpires
+              New-LocalUser -Name $env:aa2 -Password $Secure -AccountNeverExpires | Out-Null
               Add-LocalGroupMember Administrators $env:aa2
               Add-LocalGroupMember "Remote Desktop Users" $env:aa2
           }
 
-          # Display Resolution Setup (1600x1200)
           Write-Host "Setting Display Resolution to 1600x1200..."
           Add-Type -TypeDefinition @"
           using System;
@@ -64,10 +71,9 @@ jobs:
           [UserUtils]::ChangeDisplaySettings([ref]$devMode, 0) | Out-Null
           Write-Host "Display Resolution Updated."
 
-      # 2. تحميل الحزمة الأساسية (بقت للبرامج والمفتاح، لكن فشلها ما يوقفش الاتصال)
+      # 2. تحميل الحزمة (مع تسجيل واضح لأي فشل)
       - name: Download & Extract App Bundle
         continue-on-error: true
-        shell: pwsh
         run: |
           Write-Host "==== 2. DOWNLOADING APP BUNDLE ===="
           $TempDir = Join-Path $env:TEMP 'AppBundle'
@@ -75,6 +81,7 @@ jobs:
           $BundleZip = Join-Path $env:TEMP 'app_bundle.zip'
           $LinksText = Invoke-RestMethod -Uri $env:LINKS_LIST_URL
           $Urls = $LinksText -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "^http" }
+          Write-Host "Found $($Urls.Count) bundle link(s)."
           $Success = $false
           foreach ($Url in $Urls) {
               try {
@@ -83,235 +90,159 @@ jobs:
                   Expand-Archive -Path $BundleZip -DestinationPath $TempDir -Force -ErrorAction Stop
                   $Success = $true; break
               } catch {
-                  Write-Host "Link failed/corrupted. Moving to next..."
+                  Write-Warning "Link failed: $($_.Exception.Message)"
                   if (Test-Path $BundleZip) { Remove-Item $BundleZip -Force }
               }
           }
-          if (-not $Success) {
-              Write-Host "WARNING: App Bundle failed to download. RustDesk, Tailscale, NST and BitBrowser installers come from this bundle, so those features may be missing. RDP still works."
-          } else {
-              Write-Host "App Bundle extracted successfully."
+          if (-not $Success) { Write-Warning "BUNDLE NOT DOWNLOADED - NST/BitBrowser/NoMachine will be skipped." }
+          else { Get-ChildItem $TempDir -Recurse -File | Select-Object -ExpandProperty Name | ForEach-Object { Write-Host " - $_" } }
+
+      # 3. RustDesk (من الإصدار الرسمي) + ضبط الاتصال المباشر على المنفذ 21118
+      - name: RustDesk Configuration
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:TEMP 'rustdesk-setup.exe'
+          $rdUrl = 'https://github.com/rustdesk/rustdesk/releases/download/1.5.1/rustdesk-1.5.1-x86_64.exe'
+          Invoke-WebRequest $rdUrl -OutFile $exe -UseBasicParsing
+          Write-Host "Installing RustDesk 1.5.1"
+          Start-Process $exe -ArgumentList '--silent-install' | Out-Null
+          $rd = Join-Path $env:ProgramFiles 'RustDesk\rustdesk.exe'
+          for ($i=0; $i -lt 48; $i++) {
+              if ((Test-Path $rd) -and (Get-Service RustDesk -ErrorAction SilentlyContinue)) { break }
+              Start-Sleep -Seconds 5
+          }
+          if (-not (Test-Path $rd) -or -not (Get-Service RustDesk -ErrorAction SilentlyContinue)) { throw 'RustDesk did not install.' }
+
+          function Invoke-RustDeskCli {
+              param([Parameter(Mandatory=$true)][string[]]$Arguments)
+              $s = New-Object System.Diagnostics.ProcessStartInfo
+              $s.FileName = $rd; $s.UseShellExecute = $false; $s.CreateNoWindow = $true
+              $s.RedirectStandardOutput = $true; $s.RedirectStandardError = $true
+              foreach ($a in $Arguments) { [void]$s.ArgumentList.Add($a) }
+              $p = New-Object System.Diagnostics.Process; $p.StartInfo = $s
+              try {
+                  [void]$p.Start()
+                  $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+                  if (-not $p.WaitForExit(20000)) { $p.Kill($true); throw 'RustDesk CLI timed out.' }
+                  $out = $o.GetAwaiter().GetResult(); $err = $e.GetAwaiter().GetResult()
+                  if ($p.ExitCode -ne 0) { throw "RustDesk CLI exit code $($p.ExitCode)." }
+                  if (($out+$err) -match 'Installation and administrative privileges required|Settings are disabled|Failed to') { throw 'RustDesk CLI reported an error.' }
+                  return $out.Trim()
+              } finally { $p.Dispose() }
+          }
+          function Wait-DirectListener([int]$Seconds=35) {
+              $deadline = (Get-Date).AddSeconds($Seconds)
+              do {
+                  foreach ($l in @(Get-NetTCPConnection -LocalPort 21118 -State Listen -ErrorAction SilentlyContinue)) {
+                      $owner = Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue
+                      if ($owner.ProcessName -eq 'rustdesk') { return $true }
+                  }
+                  Start-Sleep -Seconds 2
+              } while ((Get-Date) -lt $deadline)
+              return $false
           }
 
-      # 3. تثبيت RustDesk (المعدل: تنزيل من المصدر الرسمي أولاً، والحزمة احتياطي)
-      - name: RustDesk Install & Direct-Access Config
-        continue-on-error: true
-        shell: python
-        run: |
-          import subprocess, os, time, urllib.request
+          # اسمح بالمنفذ 21118 لشبكة Tailscale فقط
+          Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'RustDesk' } | Disable-NetFirewallRule
+          Get-NetFirewallRule -DisplayName 'RustDesk Tailnet Only' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'RustDesk Tailnet Only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 21118 -RemoteAddress '100.64.0.0/10' -Program $rd -Profile Any | Out-Null
 
-          pw = os.environ['aa3']
-          bundle_dir = os.path.join(os.environ['TEMP'], 'AppBundle')
-          dst = os.path.join(os.environ['TEMP'], 'rustdesk_official.exe')
-          rust_exe = r"C:\Program Files\RustDesk\rustdesk.exe"
-
-          def install_from(path):
-              subprocess.run([path, "--silent-install"], check=True)
-              time.sleep(15)
-
-          installer = None
-          # أولاً: المصدر الرسمي (إصدار 1.5.1 المستخدم في TECH Decode)
-          for url in ["https://github.com/rustdesk/rustdesk/releases/download/1.5.1/rustdesk-1.5.1-x86_64.exe"]:
-              try:
-                  print(f"Downloading RustDesk from official source: {url}")
-                  urllib.request.urlretrieve(url, dst)
-                  install_from(dst)
-                  installer = url
-                  break
-              except Exception as e:
-                  print(f"Official download failed: {e}")
-
-          # ثانياً: ملف التثبيت من الحزمة (احتياطي)
-          if not installer:
-              src = next((os.path.join(root, f) for root, _, files in os.walk(bundle_dir) for f in files if "rust" in f.lower() and f.endswith(".exe")), None)
-              if src:
-                  print(f"Falling back to bundle installer: {src}")
-                  try:
-                      install_from(src)
-                      installer = src
-                  except Exception as e:
-                      print(f"Bundle install failed: {e}")
-
-          if not installer:
-              raise SystemExit("WARNING: RustDesk was not installed (official + bundle both failed). RDP still works.")
-
-          # نفس إعدادات TECH Decode: direct access عبر Tailscale على بورت 21118
-          options = [
-              ("stop-service", "Y"),
-              ("direct-server", "Y"),
-              ("direct-access-port", "21118"),
-              ("verification-method", "use-permanent-password"),
-              ("approve-mode", "password"),
-          ]
-          for key, value in options:
-              try:
-                  subprocess.run([rust_exe, "--option", key, value], check=False)
-              except Exception as e:
-                  print(f"Option {key} failed: {e}")
-
-          # كلمة السر الدائمة = aa3 (زي ما اخترت)
-          subprocess.run([rust_exe, "--password", pw], check=False)
-          time.sleep(5)
-
-          # تشغيل التطبيق في وضع المستخدم حتى يكون مستمع الاتصال المباشر جاهزاً
-          subprocess.Popen([rust_exe])
-          time.sleep(10)
-
-          try:
-              result = subprocess.run([rust_exe, "--get-id"], capture_output=True, text=True, check=True)
-              rid = result.stdout.strip()
-          except Exception as e:
-              rid = "(failed to get ID)"
-          print(f"\n{'='*30}\nRUSTDESK LOGIN\nID: {rid}\nPASS: {pw}\nDirect access port: 21118\n{'='*30}\n")
-
-      # 3.1 سحب ورفع بيانات RustDesk إلى مجلد connect_github (بدون تغيير)
-      - name: Upload RustDesk Info to Dropbox
-        continue-on-error: true
-        shell: python
-        run: |
-          import os, subprocess, json
-          from urllib.request import Request, urlopen
-          from urllib.parse import urlencode
-
-          run_id = os.environ.get('GITHUB_RUN_ID', '000000')
-          bundle_dir = os.path.join(os.environ['TEMP'], 'AppBundle')
-          api_file = os.path.join(bundle_dir, 'drop_api.txt')
-
-          print(f"Looking for drop_api.txt at: {api_file}")
-
-          creds = {}
-          with open(api_file, 'r', encoding='utf-8') as f:
-              for line in f:
-                  if '=' in line:
-                      k, v = line.strip().split('=', 1)
-                      creds[k.strip()] = v.strip()
-
-          data = urlencode({'grant_type': 'refresh_token', 'refresh_token': creds['refresh_token'], 'client_id': creds['client_id'], 'client_secret': creds['client_secret']}).encode('utf-8')
-          req = Request('https://api.dropboxapi.com/oauth2/token', data=data, method='POST')
-          with urlopen(req) as response:
-              access_token = json.loads(response.read().decode())['access_token']
-
-          def upload(file_path, dropbox_path):
-              api_arg = json.dumps({"path": dropbox_path, "mode": "overwrite"}).encode('utf-8')
-              with open(file_path, 'rb') as f: file_data = f.read()
-              req = Request('https://content.dropboxapi.com/2/files/upload', data=file_data, method='POST')
-              req.add_header('Authorization', f'Bearer {access_token}')
-              req.add_header('Dropbox-API-Arg', api_arg.decode('utf-8'))
-              req.add_header('Content-Type', 'application/octet-stream')
-              with urlopen(req) as response: print(f"Uploaded {dropbox_path}: {response.status}")
-
-          try:
-              res = subprocess.run([r"C:\Program Files\RustDesk\rustdesk.exe", "--get-id"], capture_output=True, text=True, check=True)
-              fname = f"rustdesk_{run_id}.txt"
-              open(fname, 'w').write(res.stdout.strip())
-              upload(fname, f"/connect_github/{fname}")
-          except Exception as e: print(f"RustDesk upload error: {e}")
-
-      # 4. تثبيت Tailscale (المعدل: تنزيل MSI من المصدر الرسمي أولاً، والحزمة احتياطي)
-      - name: Tailscale Setup
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $ExtractDir = Join-Path $env:TEMP 'AppBundle'
-          $TsInstaller = Get-ChildItem -Path $ExtractDir -Filter "*tailscale*.msi" -Recurse | Select-Object -First 1
-
-          # أولاً: إن لم يوجد الملف في الحزمة، ننزّله من المصدر الرسمي
-          if (-not $TsInstaller) {
-              Write-Host "No Tailscale MSI inside bundle. Downloading from official site..."
+          $settings = [ordered]@{
+              'custom-rendezvous-server' = '127.0.0.1'
+              'stop-service'             = 'N'
+              'approve-mode'             = 'password'
+              'verification-method'      = 'use-permanent-password'
+              'direct-access-port'       = '21118'
+              'direct-server'            = 'Y'
+          }
+          $ready = $false
+          for ($attempt=1; $attempt -le 3; $attempt++) {
+              Write-Host "RustDesk configuration attempt $attempt/3"
               try {
-                  $TsInstaller = Join-Path $env:TEMP 'tailscale-setup-amd64.msi'
-                  Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-amd64.msi" -OutFile $TsInstaller -UseBasicParsing -ErrorAction Stop -TimeoutSec 180
+                  if ((Get-Service RustDesk).Status -ne 'Running') { Start-Service RustDesk }
+                  $worker = $false
+                  for ($i=0; $i -lt 20; $i++) {
+                      if (Get-CimInstance Win32_Process -Filter "Name='rustdesk.exe'" | Where-Object { $_.CommandLine -match '(?:^|\s)--server(?:\s|$)' }) { $worker = $true; break }
+                      Start-Sleep -Seconds 3
+                  }
+                  if (-not $worker) { throw 'RustDesk --server worker missing.' }
+                  foreach ($kv in $settings.GetEnumerator()) {
+                      $null = Invoke-RustDeskCli @('--option', $kv.Key, $kv.Value)
+                      Start-Sleep -Milliseconds 500
+                      if ((Invoke-RustDeskCli @('--option', $kv.Key)) -ne $kv.Value) { throw "Option $($kv.Key) not confirmed." }
+                      Write-Host "Verified option: $($kv.Key)"
+                  }
+                  $r = Invoke-RustDeskCli @('--password', $env:aa3)
+                  if ($r -notmatch '(?im)^Done!\s*$') { throw 'RustDesk did not acknowledge the password.' }
+                  if (-not (Wait-DirectListener 35)) { throw 'Listener not started.' }
+                  Restart-Service RustDesk -Force
+                  Start-Sleep -Seconds 5
+                  if (-not (Wait-DirectListener 45)) { throw 'Listener did not return after restart.' }
+                  foreach ($kv in $settings.GetEnumerator()) {
+                      if ((Invoke-RustDeskCli @('--option', $kv.Key)) -ne $kv.Value) { throw "Option $($kv.Key) did not persist." }
+                  }
+                  $ready = $true; break
               } catch {
-                  Write-Host "Official Tailscale download failed: $_"
-                  $TsInstaller = $null
+                  Write-Warning $_.Exception.Message
+                  if ($attempt -lt 3) {
+                      Stop-Service RustDesk -Force -ErrorAction SilentlyContinue
+                      Get-Process rustdesk -ErrorAction SilentlyContinue | Stop-Process -Force
+                      Start-Sleep -Seconds 2; Start-Service RustDesk; Start-Sleep -Seconds 5
+                  }
               }
           }
+          if (-not $ready) { throw 'RustDesk direct access was not verified.' }
+          Write-Host "RustDesk direct-access listener is ready."
 
-          if ($TsInstaller) {
-              Start-Process msiexec.exe -ArgumentList '/i', $TsInstaller.FullName, '/quiet', '/norestart' -Wait
-          } else {
-              Write-Host "WARNING: Tailscale not installed. RDP remains available."
-          }
-
-          $TsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          $RealKey = $null
-
-          # أولاً: المفتاح من ملف key1.txt في الحزمة (زي ما اخترت)
-          $KeyFile = Get-ChildItem -Path $ExtractDir -Filter "key$($env:KEY_CHOICE).txt" -Recurse | Select-Object -First 1
-          if ($KeyFile) {
-              $Encoded = (Get-Content $KeyFile.FullName -Raw).Trim()
-              $RealKey = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Encoded)).Trim()
-              Write-Host "Using Tailscale key from key$($env:KEY_CHOICE).txt (bundle)."
-          }
-
-          # ثانياً (احتياطي): GitHub Secret باسم TAILSCALE_AUTH_KEY لو وضعتها
-          if (-not $RealKey -and $env:TS_KEY -and $env:TS_KEY -ne "''" -and $env:TS_KEY.Length -gt 5) {
-              $RealKey = $env:TS_KEY
-              Write-Host "key$($env:KEY_CHOICE).txt not found. Using GitHub Secret TAILSCALE_AUTH_KEY instead."
-          }
-
-          if (-not $RealKey) {
-              Write-Host "WARNING: No Tailscale auth key available (bundle missing and no secret set). Tailscale will not connect."
-          } else {
-              Start-Process -FilePath $TsExe -ArgumentList "up --authkey=$RealKey --hostname=RDP-Professional" -Wait
-              $ip = (& $TsExe ip -4 | Select-Object -First 1).Trim()
-              Write-Host "`n=============================="
-              Write-Host "Tailscale IP: $ip"
-              Write-Host "RDP User: runneradmin / $env:aa2"
-              Write-Host "RDP & RustDesk Password: $($env:aa3)"
-              Write-Host "RustDesk direct address: ${ip}:21118"
-              Write-Host "=============================="
-          }
-
-      # 4.1 سحب ورفع بيانات Tailscale إلى مجلد connect_github (بدون تغيير)
-      - name: Upload Tailscale Info to Dropbox
-        continue-on-error: true
-        shell: python
+      # 4. Tailscale + طباعة بيانات الاتصال
+      - name: Tailscale Setup
+        timeout-minutes: 15
         run: |
-          import os, subprocess, json
-          from urllib.request import Request, urlopen
-          from urllib.parse import urlencode
+          $ErrorActionPreference = 'Stop'
+          choco install tailscale -y --no-progress --limit-output
+          if ($LASTEXITCODE -notin @(0,1641,3010)) { throw "Tailscale install failed ($LASTEXITCODE)" }
+          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $ts)) { throw 'tailscale.exe missing.' }
 
-          run_id = os.environ.get('GITHUB_RUN_ID', '000000')
-          bundle_dir = os.path.join(os.environ['TEMP'], 'AppBundle')
-          api_file = os.path.join(bundle_dir, 'drop_api.txt')
+          $key = $env:TS_AUTHKEY
+          if ([string]::IsNullOrWhiteSpace($key) -or $key -like '*PUT_YOUR_KEY*') {
+              # احتياطي: المفتاح من ملف الحزمة (base64)
+              $kf = Get-ChildItem (Join-Path $env:TEMP 'AppBundle') -Filter "key$($env:KEY_CHOICE).txt" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $kf) { throw 'No Tailscale key: set TS_AUTHKEY or provide key file in the bundle.' }
+              $key = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content $kf.FullName -Raw).Trim())).Trim()
+          }
+          Write-Host "::add-mask::$key"
 
-          print(f"Looking for drop_api.txt at: {api_file}")
+          & $ts up "--authkey=$key" --accept-dns=false "--hostname=RDP-$env:GITHUB_RUN_ID"
+          if ($LASTEXITCODE -ne 0) { throw 'Tailscale auth failed. Key expired/used? Create a new Reusable key.' }
 
-          creds = {}
-          with open(api_file, 'r', encoding='utf-8') as f:
-              for line in f:
-                  if '=' in line:
-                      k, v = line.strip().split('=', 1)
-                      creds[k.strip()] = v.strip()
+          $ip = ''
+          for ($i=0; $i -lt 20; $i++) {
+              $ip = ((& $ts ip -4) | Select-Object -First 1)
+              if ($ip -match '^100\.\d+\.\d+\.\d+$') { break }
+              Start-Sleep -Seconds 3
+          }
+          if ($ip -notmatch '^100\.\d+\.\d+\.\d+$') { throw 'No Tailscale IPv4 assigned.' }
+          "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-          data = urlencode({'grant_type': 'refresh_token', 'refresh_token': creds['refresh_token'], 'client_id': creds['client_id'], 'client_secret': creds['client_secret']}).encode('utf-8')
-          req = Request('https://api.dropboxapi.com/oauth2/token', data=data, method='POST')
-          with urlopen(req) as response:
-              access_token = json.loads(response.read().decode())['access_token']
+          # RDP عبر Tailscale فقط
+          Get-NetFirewallRule -DisplayName 'RDP Tailnet Only' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'RDP Tailnet Only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
 
-          def upload(file_path, dropbox_path):
-              api_arg = json.dumps({"path": dropbox_path, "mode": "overwrite"}).encode('utf-8')
-              with open(file_path, 'rb') as f: file_data = f.read()
-              req = Request('https://content.dropboxapi.com/2/files/upload', data=file_data, method='POST')
-              req.add_header('Authorization', f'Bearer {access_token}')
-              req.add_header('Dropbox-API-Arg', api_arg.decode('utf-8'))
-              req.add_header('Content-Type', 'application/octet-stream')
-              with urlopen(req) as response: print(f"Uploaded {dropbox_path}: {response.status}")
+          $info = @"
+          ==============================
+          Tailscale IP     : $ip
+          RustDesk (Direct): ${ip}:21118   (Password = aa3)
+          RDP              : ${ip}:3389    User: $($env:aa2) or runneradmin  (Password = aa3)
+          ==============================
+          "@
+          Write-Host $info
+          $info | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          try:
-              res = subprocess.run([r"C:\Program Files\Tailscale\tailscale.exe", "ip", "-4"], capture_output=True, text=True, check=True)
-              ip = res.stdout.strip().split('\n')[0].strip()
-              fname = f"tailscale_{run_id}.txt"
-              with open(fname, 'w') as f:
-                  f.write(f"Node IPv4 Allocation: {ip}\nIdentity Profile Context: runneradmin\nCredential Lock: {os.environ.get('aa3', '')}\n")
-              upload(fname, f"/connect_github/{fname}")
-          except Exception as e: print(f"Tailscale upload error: {e}")
-
-      # 5. استخراج الملفات الداخلية (بدون تغيير)
+      # 5. ملفات سطح المكتب
       - name: Deploy Important Files to Desktop
         continue-on-error: true
-        shell: pwsh
         run: |
           $BundleDir = Join-Path $env:TEMP 'AppBundle'
           $DesktopPath = Join-Path $env:USERPROFILE 'Desktop'
@@ -326,61 +257,47 @@ jobs:
                           Expand-Archive -Path $TempZip -DestinationPath $DestPath -Force -ErrorAction Stop
                           Remove-Item $TempZip -Force
                           return $true
-                      } catch { if (Test-Path $TempZip) { Remove-Item $TempZip -Force } }
+                      } catch { Write-Warning "Failed: $Url"; if (Test-Path $TempZip) { Remove-Item $TempZip -Force } }
                   }
               }
               return $false
           }
-          $File1 = Get-ChildItem -Path $BundleDir -Filter "Link ZIP_URL.txt" -Recurse | Select-Object -First 1
+          $File1 = Get-ChildItem -Path $BundleDir -Filter "Link ZIP_URL.txt" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($File1) {
               $DesktopExtract = Join-Path $env:TEMP 'DesktopFiles'
               if (Download-And-Verify $File1.FullName $DesktopExtract) {
                   Get-ChildItem -Path $DesktopExtract -Recurse -File | ForEach-Object { Move-Item $_.FullName $DesktopPath -Force -ErrorAction SilentlyContinue }
               }
           }
-          $File2 = Get-ChildItem -Path $BundleDir -Filter "*THREE_ZIP_URL*.txt" -Recurse | Select-Object -First 1
+          $File2 = Get-ChildItem -Path $BundleDir -Filter "*THREE_ZIP_URL*.txt" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($File2) {
               $ThreeDir = Join-Path $env:TEMP 'THREE_EXTRACTED'
               Download-And-Verify $File2.FullName $ThreeDir | Out-Null
           }
 
-      # 6. تثبيت المتصفحات والكيرنل (بدون تغيير)
+      # 6. المتصفحات والكيرنل
       - name: Browser & Kernel Setup
         continue-on-error: true
-        shell: pwsh
         run: |
           $BundleDir = Join-Path $env:TEMP 'AppBundle'
           $ThreeDir = Join-Path $env:TEMP 'THREE_EXTRACTED'
 
-          # NST Browser - تثبيت تفاعلي باستخدام محاكاة المفاتيح
-          $NstInst = Get-ChildItem -Path $BundleDir -Filter "*nst*.exe" -Recurse | Select-Object -First 1
+          $NstInst = Get-ChildItem -Path $BundleDir -Filter "*nst*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($NstInst) {
               Write-Host "Starting NST Browser installation with UI automation..."
               Start-Process -FilePath $NstInst.FullName
-              Start-Sleep -Seconds 5 # انتظار نافذة اختيار اللغة
-
+              Start-Sleep -Seconds 5
               $wshell = New-Object -ComObject WScript.Shell
-
-              # الصفحة 1: اختيار اللغة
               if ($wshell.AppActivate("Installer Language")) {
-                  Write-Host "Language window detected. Pressing OK..."
-                  $wshell.SendKeys("{ENTER}")
-                  Start-Sleep -Seconds 3
+                  $wshell.SendKeys("{ENTER}"); Start-Sleep -Seconds 3
               }
-
-              # الصفحة 2 و 3: خيارات التثبيت والمسار
               if ($wshell.AppActivate("Nstbrowser Setup")) {
-                  Write-Host "Setup window detected. Pressing Next and Install..."
-                  $wshell.SendKeys("{ENTER}") # Next
-                  Start-Sleep -Seconds 2
-                  $wshell.SendKeys("{ENTER}") # Install
-                  Start-Sleep -Seconds 15 # انتظار انتهاء التثبيت (5-10 ثوانٍ + هامان أمان)
-                  $wshell.SendKeys("{ENTER}") # Finish
+                  $wshell.SendKeys("{ENTER}"); Start-Sleep -Seconds 2
+                  $wshell.SendKeys("{ENTER}"); Start-Sleep -Seconds 15
+                  $wshell.SendKeys("{ENTER}")
               }
               Write-Host "NST Browser installation completed."
-
-              # استخراج الكيرنل
-              $NstK = Get-ChildItem -Path $ThreeDir -Filter "nstchrome.zip" -Recurse | Select-Object -First 1
+              $NstK = Get-ChildItem -Path $ThreeDir -Filter "nstchrome.zip" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
               if ($NstK) {
                   $NstDest = "C:\Users\runneradmin\.nst-agent\download\kernels\nstchrome"
                   New-Item -ItemType Directory -Path $NstDest -Force | Out-Null
@@ -388,11 +305,10 @@ jobs:
               }
           }
 
-          # BitBrowser
-          $BitInst = Get-ChildItem -Path $BundleDir -Filter "*BitBrowser*.exe" -Recurse | Select-Object -First 1
+          $BitInst = Get-ChildItem -Path $BundleDir -Filter "*BitBrowser*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($BitInst) {
               Start-Process -FilePath $BitInst.FullName -ArgumentList "/S", "/allusers", "/norestart" -Wait
-              $BitK = Get-ChildItem -Path $ThreeDir -Filter "bitchrom.zip" -Recurse | Select-Object -First 1
+              $BitK = Get-ChildItem -Path $ThreeDir -Filter "bitchrom.zip" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
               if ($BitK) {
                   $BitDest = "C:\Users\runneradmin\AppData\Roaming\BitBrowser\Chrome-bin"
                   New-Item -ItemType Directory -Path $BitDest -Force | Out-Null
@@ -400,48 +316,40 @@ jobs:
               }
           }
 
-      # 7. تثبيت NoMachine (بدون تغيير)
+      # 7. NoMachine
       - name: Install NoMachine
         continue-on-error: true
-        shell: pwsh
         run: |
-          $NmInstaller = Get-ChildItem -Path (Join-Path $env:TEMP 'AppBundle') -Filter "*nomachine*.exe" -Recurse | Select-Object -First 1
+          $NmInstaller = Get-ChildItem -Path (Join-Path $env:TEMP 'AppBundle') -Filter "*nomachine*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($NmInstaller) { Start-Process -FilePath $NmInstaller.FullName -ArgumentList "/VERYSILENT", "/NORESTART" -Wait }
+          else { Write-Warning "NoMachine installer not found in bundle." }
 
-      # 8. العداد الذكي مع إشعارات تفاعلية (بدون تغيير)
-      - name: Keep Session Alive with Interactive Alerts
-        shell: pwsh
+      # 8. العدّاد (بدون نوافذ منبثقة قد تعلّق الخطوة؛ التنبيهات تُكتب في السجل)
+      - name: Keep Session Alive
         run: |
           Write-Host "==== SETUP COMPLETED. STARTING TIMER ===="
-          $KeepAliveMinutes = [int]$env:TIME_JOB
-          $startTime = Get-Date
-          $endTime = $startTime.AddMinutes($KeepAliveMinutes)
-
-          $alertedTimes = @(60, 30, 15, 5)
-          Add-Type -AssemblyName PresentationFramework
-
-          Write-Host "Running custom timer for $KeepAliveMinutes minutes..."
-
-          while ((Get-Date) -lt $endTime) {
-              $remaining = [math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
-
-              if ($remaining -in $alertedTimes) {
-                  $msg = "Session is running. $remaining minutes remaining before file check."
-                  $title = "GitHub Actions Timer - $remaining Minutes Left"
-
-                  Write-Host "Showing interactive alert for $remaining minutes..."
-                  $result = [System.Windows.MessageBox]::Show($msg, $title, 'YesNo', 'Information')
-
-                  $alertedTimes = $alertedTimes | Where-Object { $_ -ne $remaining }
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP | RustDesk: $env:TAILSCALE_IP`:21118 | RDP: $env:TAILSCALE_IP`:3389"
+          $end = (Get-Date).AddMinutes([int]$env:TIME_JOB)
+          $alerted = @(60, 30, 15, 5)
+          while ((Get-Date) -lt $end) {
+              $remaining = [math]::Ceiling(($end - (Get-Date)).TotalMinutes)
+              if ($remaining -in $alerted) {
+                  Write-Host "Session is running. $remaining minutes remaining."
+                  $alerted = $alerted | Where-Object { $_ -ne $remaining }
               }
-
               Start-Sleep -Seconds 10
           }
-
           $StopFile = "C:\stop11stop.txt"
           if (Test-Path $StopFile) {
               Write-Host "File [$StopFile] FOUND. Waiting for GitHub forced timeout..."
-              while($true) { Start-Sleep -Seconds 3600 }
+              while ($true) { Start-Sleep -Seconds 3600 }
           } else {
-              Write-Host "File [$StopFile] NOT found. Closing script now."
+              Write-Host "File [$StopFile] NOT found. Closing now."
           }
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (Test-Path $ts) { & $ts logout }
+          exit 0
