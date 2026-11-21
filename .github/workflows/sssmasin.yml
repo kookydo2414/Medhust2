@@ -1,51 +1,48 @@
-name: AA_Testcc_Win 11
+name: AA_Tsdsdsin 11
 on:
   workflow_dispatch:
 
 jobs:
   deployment:
     runs-on: windows-2022
-    timeout-minutes: 360          # حد GitHub الأقصى لأي job هو 360 دقيقة
-    defaults:
-      run:
-        shell: pwsh
+    timeout-minutes: 800
     env:
-      # ===================== عدّل هذه القيم فقط =====================
-      TS_AUTHKEY: "tskey-auth-PUT_YOUR_KEY_HERE"   # مفتاح Tailscale (يُفضّل Reusable + Ephemeral)
-      aa2: "PUT_WINDOWS_USERNAME"                  # اسم مستخدم ويندوز الجديد
-      aa3: "PUT_STRONG_PASSWORD_12CHARS"           # كلمة سر ويندوز + RustDesk (12 حرف أو أكثر، بلا مسافات)
-      TIME_JOB: "330"                              # مدة الجلسة بالدقائق (لا تتجاوز 340)
-      LINKS_LIST_URL: "https://tinyurl.com/ddaS441581"   # رابط حزمة NST/BitBrowser/NoMachine
-      KEY_CHOICE: "1"                              # احتياطي: يُستخدم key1.txt من الحزمة لو TS_AUTHKEY فارغ
-      # ==============================================================
+      TIME_JOB: "340"
+      aa2: "XCDOOD"
+      aa3: "Zxxz4444"
+      LINKS_LIST_URL: "https://tinyurl.com/ddaS441581"
+      KEY_CHOICE: "1"
+      PYTHONIOENCODING: "utf-8"
 
     steps:
-      # 0. فحص القيم قبل البدء
-      - name: Validate settings
-        run: |
-          if ($env:aa3.Length -lt 12 -or $env:aa3 -match '\s') { throw 'aa3 must be at least 12 chars with no spaces.' }
-          if ($env:aa2 -like 'PUT_*') { throw 'Edit aa2 (username) in the env block.' }
-          if ($env:TS_AUTHKEY -like '*PUT_YOUR_KEY*') { Write-Warning 'TS_AUTHKEY not set; will try key file from the bundle.' }
-          Write-Host "::add-mask::$env:aa3"
-          Write-Host "::add-mask::$env:TS_AUTHKEY"
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # 1. إعداد النظام والمستخدمين والدقة
+      # 1. إعداد النظام، المستخدمين، RDP (على شبكة Tailscale فقط)، وتغيير دقة الشاشة
       - name: System, RDP & Display Setup
         continue-on-error: true
+        shell: pwsh
         run: |
           Write-Host "==== 1. CONFIGURING RDP, USERS & DISPLAY ===="
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0 -Force
           netsh advfirewall firewall set rule group="Remote Desktop" new enable=Yes
+          # قصر RDP على شبكة Tailscale فقط (100.64.0.0/10)
+          try {
+              Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop | Set-NetFirewallRule -RemoteAddress '100.64.0.0/10'
+              Write-Host "RDP firewall rules limited to Tailscale range."
+          } catch { Write-Host "::warning::Could not restrict RDP firewall rules: $($_.Exception.Message)" }
 
-          $Secure = ConvertTo-SecureString $env:aa3 -AsPlainText -Force
+          $Pass = $env:aa3
+          $Secure = ConvertTo-SecureString $Pass -AsPlainText -Force
           Set-LocalUser -Name "runneradmin" -Password $Secure
           if (-not (Get-LocalUser -Name $env:aa2 -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name $env:aa2 -Password $Secure -AccountNeverExpires | Out-Null
+              New-LocalUser -Name $env:aa2 -Password $Secure -AccountNeverExpires
               Add-LocalGroupMember Administrators $env:aa2
               Add-LocalGroupMember "Remote Desktop Users" $env:aa2
           }
 
+          # Display Resolution Setup (1600x1200)
           Write-Host "Setting Display Resolution to 1600x1200..."
           Add-Type -TypeDefinition @"
           using System;
@@ -71,18 +68,23 @@ jobs:
           [UserUtils]::ChangeDisplaySettings([ref]$devMode, 0) | Out-Null
           Write-Host "Display Resolution Updated."
 
-      # 2. تحميل الحزمة (مع تسجيل واضح لأي فشل)
+      # 2. تحميل الحزمة الأساسية
       - name: Download & Extract App Bundle
         continue-on-error: true
+        shell: pwsh
         run: |
           Write-Host "==== 2. DOWNLOADING APP BUNDLE ===="
           $TempDir = Join-Path $env:TEMP 'AppBundle'
           New-Item -Path $TempDir -ItemType Directory -Force | Out-Null
           $BundleZip = Join-Path $env:TEMP 'app_bundle.zip'
-          $LinksText = Invoke-RestMethod -Uri $env:LINKS_LIST_URL
-          $Urls = $LinksText -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "^http" }
-          Write-Host "Found $($Urls.Count) bundle link(s)."
           $Success = $false
+          try {
+              $LinksText = Invoke-RestMethod -Uri $env:LINKS_LIST_URL
+              $Urls = $LinksText -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "^http" }
+          } catch {
+              Write-Host "::warning::Could not read the links list: $($_.Exception.Message)"
+              $Urls = @()
+          }
           foreach ($Url in $Urls) {
               try {
                   Write-Host "Trying Bundle Link: $Url"
@@ -90,52 +92,79 @@ jobs:
                   Expand-Archive -Path $BundleZip -DestinationPath $TempDir -Force -ErrorAction Stop
                   $Success = $true; break
               } catch {
-                  Write-Warning "Link failed: $($_.Exception.Message)"
+                  Write-Host "Link failed/corrupted: $($_.Exception.Message). Moving to next..."
                   if (Test-Path $BundleZip) { Remove-Item $BundleZip -Force }
               }
           }
-          if (-not $Success) { Write-Warning "BUNDLE NOT DOWNLOADED - NST/BitBrowser/NoMachine will be skipped." }
-          else { Get-ChildItem $TempDir -Recurse -File | Select-Object -ExpandProperty Name | ForEach-Object { Write-Host " - $_" } }
+          if ($Success) {
+              Write-Host "Bundle downloaded and extracted OK."
+              Get-ChildItem -Path $TempDir -Recurse -File | ForEach-Object { Write-Host "  - $($_.Name)" }
+          } else {
+              Write-Host "::warning::App bundle download FAILED on all links. Continuing without it (RustDesk/Tailscale/Dropbox/apps will be skipped)."
+          }
 
-      # 3. RustDesk (من الإصدار الرسمي) + ضبط الاتصال المباشر على المنفذ 21118
+      # 3. تثبيت RustDesk من الحزمة (Direct access عبر Tailscale على بورت 21118)
       - name: RustDesk Configuration
-        timeout-minutes: 12
+        continue-on-error: true
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe = Join-Path $env:TEMP 'rustdesk-setup.exe'
-          $rdUrl = 'https://github.com/rustdesk/rustdesk/releases/download/1.5.1/rustdesk-1.5.1-x86_64.exe'
-          Invoke-WebRequest $rdUrl -OutFile $exe -UseBasicParsing
-          Write-Host "Installing RustDesk 1.5.1"
-          Start-Process $exe -ArgumentList '--silent-install' | Out-Null
+          "RUSTDESK_OK=0" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "::add-mask::$env:aa3"
+          $BundleDir = Join-Path $env:TEMP 'AppBundle'
+          $Installer = $null
+          if (Test-Path $BundleDir) {
+              $Installer = Get-ChildItem -Path $BundleDir -Filter "*rust*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $Installer) {
+              Write-Host "::warning::RustDesk installer NOT found in the bundle. Skipping RustDesk."
+              exit 0
+          }
+          Write-Host "Installing RustDesk from bundle: $($Installer.Name)"
+          Start-Process $Installer.FullName -ArgumentList '--silent-install' | Out-Null
           $rd = Join-Path $env:ProgramFiles 'RustDesk\rustdesk.exe'
-          for ($i=0; $i -lt 48; $i++) {
+          for ($i = 0; $i -lt 48; $i++) {
               if ((Test-Path $rd) -and (Get-Service RustDesk -ErrorAction SilentlyContinue)) { break }
               Start-Sleep -Seconds 5
           }
-          if (-not (Test-Path $rd) -or -not (Get-Service RustDesk -ErrorAction SilentlyContinue)) { throw 'RustDesk did not install.' }
+          if (-not (Test-Path $rd) -or -not (Get-Service RustDesk -ErrorAction SilentlyContinue)) {
+              throw 'RustDesk executable or service did not appear within four minutes.'
+          }
 
           function Invoke-RustDeskCli {
               param([Parameter(Mandatory=$true)][string[]]$Arguments)
-              $s = New-Object System.Diagnostics.ProcessStartInfo
-              $s.FileName = $rd; $s.UseShellExecute = $false; $s.CreateNoWindow = $true
-              $s.RedirectStandardOutput = $true; $s.RedirectStandardError = $true
-              foreach ($a in $Arguments) { [void]$s.ArgumentList.Add($a) }
-              $p = New-Object System.Diagnostics.Process; $p.StartInfo = $s
+              $start = New-Object System.Diagnostics.ProcessStartInfo
+              $start.FileName = $rd
+              $start.UseShellExecute = $false
+              $start.CreateNoWindow = $true
+              $start.RedirectStandardOutput = $true
+              $start.RedirectStandardError = $true
+              foreach ($argument in $Arguments) { [void]$start.ArgumentList.Add($argument) }
+              $process = New-Object System.Diagnostics.Process
+              $process.StartInfo = $start
               try {
-                  [void]$p.Start()
-                  $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
-                  if (-not $p.WaitForExit(20000)) { $p.Kill($true); throw 'RustDesk CLI timed out.' }
-                  $out = $o.GetAwaiter().GetResult(); $err = $e.GetAwaiter().GetResult()
-                  if ($p.ExitCode -ne 0) { throw "RustDesk CLI exit code $($p.ExitCode)." }
-                  if (($out+$err) -match 'Installation and administrative privileges required|Settings are disabled|Failed to') { throw 'RustDesk CLI reported an error.' }
-                  return $out.Trim()
-              } finally { $p.Dispose() }
+                  if (-not $process.Start()) { throw 'RustDesk CLI did not start.' }
+                  $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                  $stderrTask = $process.StandardError.ReadToEndAsync()
+                  if (-not $process.WaitForExit(20000)) {
+                      $process.Kill($true); $process.WaitForExit()
+                      throw 'RustDesk CLI timed out after 20 seconds.'
+                  }
+                  $stdout = $stdoutTask.GetAwaiter().GetResult()
+                  $stderr = $stderrTask.GetAwaiter().GetResult()
+                  if ($process.ExitCode -ne 0) { throw "RustDesk CLI exited with code $($process.ExitCode)." }
+                  if (($stdout + $stderr) -match 'Installation and administrative privileges required|Settings are disabled|Failed to') {
+                      throw 'RustDesk CLI reported an error; check service readiness and administrator privileges.'
+                  }
+                  return $stdout.Trim()
+              } finally { $process.Dispose() }
           }
-          function Wait-DirectListener([int]$Seconds=35) {
+          function Wait-DirectListener([int]$Seconds = 35) {
               $deadline = (Get-Date).AddSeconds($Seconds)
               do {
-                  foreach ($l in @(Get-NetTCPConnection -LocalPort 21118 -State Listen -ErrorAction SilentlyContinue)) {
-                      $owner = Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue
+                  $listeners = @(Get-NetTCPConnection -LocalPort 21118 -State Listen -ErrorAction SilentlyContinue)
+                  foreach ($listener in $listeners) {
+                      $owner = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
                       if ($owner.ProcessName -eq 'rustdesk') { return $true }
                   }
                   Start-Sleep -Seconds 2
@@ -143,8 +172,9 @@ jobs:
               return $false
           }
 
-          # اسمح بالمنفذ 21118 لشبكة Tailscale فقط
+          # إزالة قواعد الجدار الناري العامة وإبقاء قاعدة لشبكة Tailscale فقط
           Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'RustDesk' } | Disable-NetFirewallRule
+          Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue | Where-Object { $_.Program -like '*\RustDesk\rustdesk.exe' } | Get-NetFirewallRule | Where-Object { $_.Direction -eq 'Inbound' } | Disable-NetFirewallRule
           Get-NetFirewallRule -DisplayName 'RustDesk Tailnet Only' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
           New-NetFirewallRule -DisplayName 'RustDesk Tailnet Only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 21118 -RemoteAddress '100.64.0.0/10' -Program $rd -Profile Any | Out-Null
 
@@ -157,92 +187,227 @@ jobs:
               'direct-server'            = 'Y'
           }
           $ready = $false
-          for ($attempt=1; $attempt -le 3; $attempt++) {
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
               Write-Host "RustDesk configuration attempt $attempt/3"
               try {
                   if ((Get-Service RustDesk).Status -ne 'Running') { Start-Service RustDesk }
-                  $worker = $false
-                  for ($i=0; $i -lt 20; $i++) {
-                      if (Get-CimInstance Win32_Process -Filter "Name='rustdesk.exe'" | Where-Object { $_.CommandLine -match '(?:^|\s)--server(?:\s|$)' }) { $worker = $true; break }
+                  $workerReady = $false
+                  for ($i = 0; $i -lt 20; $i++) {
+                      $worker = Get-CimInstance Win32_Process -Filter "Name='rustdesk.exe'" | Where-Object { $_.CommandLine -match '(?:^|\s)--server(?:\s|$)' }
+                      if ($worker) { $workerReady = $true; break }
                       Start-Sleep -Seconds 3
                   }
-                  if (-not $worker) { throw 'RustDesk --server worker missing.' }
-                  foreach ($kv in $settings.GetEnumerator()) {
-                      $null = Invoke-RustDeskCli @('--option', $kv.Key, $kv.Value)
+                  if (-not $workerReady) { throw 'RustDesk service is running but its --server worker is missing.' }
+                  foreach ($entry in $settings.GetEnumerator()) {
+                      $null = Invoke-RustDeskCli -Arguments @('--option', $entry.Key, $entry.Value)
                       Start-Sleep -Milliseconds 500
-                      if ((Invoke-RustDeskCli @('--option', $kv.Key)) -ne $kv.Value) { throw "Option $($kv.Key) not confirmed." }
-                      Write-Host "Verified option: $($kv.Key)"
+                      $actual = Invoke-RustDeskCli -Arguments @('--option', $entry.Key)
+                      if ($actual -ne $entry.Value) { throw "RustDesk did not confirm option $($entry.Key)." }
+                      Write-Host "Verified option: $($entry.Key)"
                   }
-                  $r = Invoke-RustDeskCli @('--password', $env:aa3)
-                  if ($r -notmatch '(?im)^Done!\s*$') { throw 'RustDesk did not acknowledge the password.' }
-                  if (-not (Wait-DirectListener 35)) { throw 'Listener not started.' }
+                  $passwordResult = Invoke-RustDeskCli -Arguments @('--password', $env:aa3)
+                  if ($passwordResult -notmatch '(?im)^Done!\s*$') { throw 'RustDesk did not acknowledge the permanent password.' }
+                  $passwordResult = $null
+                  if (-not (Wait-DirectListener 35)) { throw 'Settings were verified but the RustDesk listener has not started.' }
                   Restart-Service RustDesk -Force
                   Start-Sleep -Seconds 5
-                  if (-not (Wait-DirectListener 45)) { throw 'Listener did not return after restart.' }
-                  foreach ($kv in $settings.GetEnumerator()) {
-                      if ((Invoke-RustDeskCli @('--option', $kv.Key)) -ne $kv.Value) { throw "Option $($kv.Key) did not persist." }
+                  if (-not (Wait-DirectListener 45)) { throw 'RustDesk listener did not return after service restart.' }
+                  foreach ($entry in $settings.GetEnumerator()) {
+                      $actual = Invoke-RustDeskCli -Arguments @('--option', $entry.Key)
+                      if ($actual -ne $entry.Value) { throw "Option $($entry.Key) did not persist after restart." }
                   }
-                  $ready = $true; break
+                  $ready = $true
+                  break
               } catch {
                   Write-Warning $_.Exception.Message
                   if ($attempt -lt 3) {
                       Stop-Service RustDesk -Force -ErrorAction SilentlyContinue
                       Get-Process rustdesk -ErrorAction SilentlyContinue | Stop-Process -Force
-                      Start-Sleep -Seconds 2; Start-Service RustDesk; Start-Sleep -Seconds 5
+                      Start-Sleep -Seconds 2
+                      Start-Service RustDesk
+                      Start-Sleep -Seconds 5
                   }
               }
           }
-          if (-not $ready) { throw 'RustDesk direct access was not verified.' }
-          Write-Host "RustDesk direct-access listener is ready."
+          if (-not $ready) { throw 'RustDesk direct access was not verified (see warnings above).' }
 
-      # 4. Tailscale + طباعة بيانات الاتصال
+          $rdId = 'unavailable'
+          try { $rdId = Invoke-RustDeskCli -Arguments @('--get-id') } catch { Write-Host "Could not read RustDesk ID (not needed for direct access)." }
+          "RUSTDESK_OK=1" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "RUSTDESK_ID=$rdId" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "RustDesk direct-access listener is ready on port 21118 (Tailscale only)."
+
+      # 3.1 رفع بيانات RustDesk إلى Dropbox (مجلد connect_github)
+      - name: Upload RustDesk Info to Dropbox
+        continue-on-error: true
+        shell: python
+        run: |
+          import os, json, sys
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlencode
+
+          if os.environ.get('RUSTDESK_OK') != '1':
+              print("::warning::RustDesk was not set up, nothing to upload.")
+              sys.exit(0)
+
+          run_id = os.environ.get('GITHUB_RUN_ID', '000000')
+          api_file = os.path.join(os.environ['TEMP'], 'AppBundle', 'drop_api.txt')
+          if not os.path.exists(api_file):
+              print(f"::warning::drop_api.txt not found at {api_file}. Skipping Dropbox upload.")
+              sys.exit(0)
+
+          creds = {}
+          with open(api_file, 'r', encoding='utf-8') as f:
+              for line in f:
+                  if '=' in line:
+                      k, v = line.strip().split('=', 1)
+                      creds[k.strip()] = v.strip()
+
+          data = urlencode({'grant_type': 'refresh_token', 'refresh_token': creds['refresh_token'], 'client_id': creds['client_id'], 'client_secret': creds['client_secret']}).encode('utf-8')
+          req = Request('https://api.dropboxapi.com/oauth2/token', data=data, method='POST')
+          with urlopen(req) as response:
+              access_token = json.loads(response.read().decode())['access_token']
+
+          def upload(file_path, dropbox_path):
+              api_arg = json.dumps({"path": dropbox_path, "mode": "overwrite"})
+              with open(file_path, 'rb') as f: file_data = f.read()
+              req = Request('https://content.dropboxapi.com/2/files/upload', data=file_data, method='POST')
+              req.add_header('Authorization', f'Bearer {access_token}')
+              req.add_header('Dropbox-API-Arg', api_arg)
+              req.add_header('Content-Type', 'application/octet-stream')
+              with urlopen(req) as response: print(f"Uploaded {dropbox_path}: {response.status}")
+
+          try:
+              fname = f"rustdesk_{run_id}.txt"
+              with open(fname, 'w', encoding='utf-8') as f:
+                  f.write(f"RustDesk ID (local only, public server disabled): {os.environ.get('RUSTDESK_ID', '')}\n")
+                  f.write("Direct access port: 21118 (via Tailscale)\n")
+                  f.write(f"Password: {os.environ.get('aa3', '')}\n")
+              upload(fname, f"/connect_github/{fname}")
+          except Exception as e:
+              print(f"::warning::RustDesk upload error: {e}")
+
+      # 4. تثبيت Tailscale من الحزمة والاتصال بالمفتاح
       - name: Tailscale Setup
-        timeout-minutes: 15
+        continue-on-error: true
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          choco install tailscale -y --no-progress --limit-output
-          if ($LASTEXITCODE -notin @(0,1641,3010)) { throw "Tailscale install failed ($LASTEXITCODE)" }
-          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          if (-not (Test-Path $ts)) { throw 'tailscale.exe missing.' }
-
-          $key = $env:TS_AUTHKEY
-          if ([string]::IsNullOrWhiteSpace($key) -or $key -like '*PUT_YOUR_KEY*') {
-              # احتياطي: المفتاح من ملف الحزمة (base64)
-              $kf = Get-ChildItem (Join-Path $env:TEMP 'AppBundle') -Filter "key$($env:KEY_CHOICE).txt" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if (-not $kf) { throw 'No Tailscale key: set TS_AUTHKEY or provide key file in the bundle.' }
-              $key = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content $kf.FullName -Raw).Trim())).Trim()
+          "TAILSCALE_OK=0" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $ExtractDir = Join-Path $env:TEMP 'AppBundle'
+          $TsInstaller = $null; $KeyFile = $null
+          if (Test-Path $ExtractDir) {
+              $TsInstaller = Get-ChildItem -Path $ExtractDir -Filter "*tailscale*.msi" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              $KeyFile = Get-ChildItem -Path $ExtractDir -Filter "key$($env:KEY_CHOICE).txt" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           }
-          Write-Host "::add-mask::$key"
+          if (-not $TsInstaller) { Write-Host "::warning::Tailscale MSI NOT found in the bundle. Skipping Tailscale."; exit 0 }
+          if (-not $KeyFile) { Write-Host "::warning::key$($env:KEY_CHOICE).txt NOT found in the bundle. Skipping Tailscale."; exit 0 }
 
-          & $ts up "--authkey=$key" --accept-dns=false "--hostname=RDP-$env:GITHUB_RUN_ID"
-          if ($LASTEXITCODE -ne 0) { throw 'Tailscale auth failed. Key expired/used? Create a new Reusable key.' }
+          Write-Host "Installing Tailscale from bundle: $($TsInstaller.Name)"
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$($TsInstaller.FullName)`"", '/quiet', '/norestart' -Wait -PassThru
+          if ($p.ExitCode -notin @(0, 1641, 3010)) { throw "Tailscale MSI install failed with code $($p.ExitCode)" }
+          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          for ($i = 0; $i -lt 30; $i++) { if (Test-Path $ts) { break }; Start-Sleep -Seconds 2 }
+          if (-not (Test-Path $ts)) { throw 'Tailscale executable missing after install.' }
+          $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+          if ($svc -and $svc.Status -ne 'Running') { Start-Service Tailscale }
+          Start-Sleep -Seconds 5
+
+          $Encoded = (Get-Content $KeyFile.FullName -Raw).Trim()
+          $RealKey = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Encoded)).Trim()
+          Write-Host "::add-mask::$RealKey"
+
+          $hostname = "RDP-Professional-$($env:GITHUB_RUN_ID)"
+          $upOk = $false
+          for ($a = 1; $a -le 3; $a++) {
+              Write-Host "Tailscale up attempt $a/3"
+              & $ts up "--authkey=$RealKey" --accept-dns=false "--hostname=$hostname"
+              if ($LASTEXITCODE -eq 0) { $upOk = $true; break }
+              Start-Sleep -Seconds 5
+          }
+          if (-not $upOk) { throw 'Tailscale authentication failed. Check the auth key (expired/used?), device approval and tailnet policy.' }
 
           $ip = ''
-          for ($i=0; $i -lt 20; $i++) {
+          for ($i = 0; $i -lt 20; $i++) {
               $ip = ((& $ts ip -4) | Select-Object -First 1)
               if ($ip -match '^100\.\d+\.\d+\.\d+$') { break }
               Start-Sleep -Seconds 3
           }
-          if ($ip -notmatch '^100\.\d+\.\d+\.\d+$') { throw 'No Tailscale IPv4 assigned.' }
+          if ($ip -notmatch '^100\.\d+\.\d+\.\d+$') { throw 'No Tailscale IPv4 address was assigned.' }
           "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TAILSCALE_OK=1" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-          # RDP عبر Tailscale فقط
-          Get-NetFirewallRule -DisplayName 'RDP Tailnet Only' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-          New-NetFirewallRule -DisplayName 'RDP Tailnet Only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+          Write-Host "`n=============================="
+          Write-Host "Tailscale IP:         $ip"
+          Write-Host "RustDesk direct:      ${ip}:21118"
+          Write-Host "RDP:                  ${ip}:3389"
+          Write-Host "User:                 runneradmin  /  $($env:aa2)"
+          Write-Host "(Password: same as aa3, uploaded to Dropbox)"
+          Write-Host "=============================="
+          @"
+          ## Connection
+          - Tailscale IP: **$ip**
+          - RustDesk direct address: **${ip}:21118**
+          - RDP: **${ip}:3389** (user: runneradmin or $($env:aa2))
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          $info = @"
-          ==============================
-          Tailscale IP     : $ip
-          RustDesk (Direct): ${ip}:21118   (Password = aa3)
-          RDP              : ${ip}:3389    User: $($env:aa2) or runneradmin  (Password = aa3)
-          ==============================
-          "@
-          Write-Host $info
-          $info | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+      # 4.1 رفع بيانات Tailscale إلى Dropbox (مجلد connect_github)
+      - name: Upload Tailscale Info to Dropbox
+        continue-on-error: true
+        shell: python
+        run: |
+          import os, json, sys
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlencode
 
-      # 5. ملفات سطح المكتب
+          if os.environ.get('TAILSCALE_OK') != '1':
+              print("::warning::Tailscale was not set up, nothing to upload.")
+              sys.exit(0)
+
+          run_id = os.environ.get('GITHUB_RUN_ID', '000000')
+          api_file = os.path.join(os.environ['TEMP'], 'AppBundle', 'drop_api.txt')
+          if not os.path.exists(api_file):
+              print(f"::warning::drop_api.txt not found at {api_file}. Skipping Dropbox upload.")
+              sys.exit(0)
+
+          creds = {}
+          with open(api_file, 'r', encoding='utf-8') as f:
+              for line in f:
+                  if '=' in line:
+                      k, v = line.strip().split('=', 1)
+                      creds[k.strip()] = v.strip()
+
+          data = urlencode({'grant_type': 'refresh_token', 'refresh_token': creds['refresh_token'], 'client_id': creds['client_id'], 'client_secret': creds['client_secret']}).encode('utf-8')
+          req = Request('https://api.dropboxapi.com/oauth2/token', data=data, method='POST')
+          with urlopen(req) as response:
+              access_token = json.loads(response.read().decode())['access_token']
+
+          def upload(file_path, dropbox_path):
+              api_arg = json.dumps({"path": dropbox_path, "mode": "overwrite"})
+              with open(file_path, 'rb') as f: file_data = f.read()
+              req = Request('https://content.dropboxapi.com/2/files/upload', data=file_data, method='POST')
+              req.add_header('Authorization', f'Bearer {access_token}')
+              req.add_header('Dropbox-API-Arg', api_arg)
+              req.add_header('Content-Type', 'application/octet-stream')
+              with urlopen(req) as response: print(f"Uploaded {dropbox_path}: {response.status}")
+
+          try:
+              ip = os.environ.get('TAILSCALE_IP', '')
+              fname = f"tailscale_{run_id}.txt"
+              with open(fname, 'w', encoding='utf-8') as f:
+                  f.write(f"Tailscale IPv4: {ip}\n")
+                  f.write(f"RustDesk direct address: {ip}:21118\n")
+                  f.write(f"RDP address: {ip}:3389\n")
+                  f.write(f"Users: runneradmin / {os.environ.get('aa2', '')}\n")
+                  f.write(f"Password: {os.environ.get('aa3', '')}\n")
+              upload(fname, f"/connect_github/{fname}")
+          except Exception as e:
+              print(f"::warning::Tailscale upload error: {e}")
+
+      # 5. استخراج الملفات الداخلية
       - name: Deploy Important Files to Desktop
         continue-on-error: true
+        shell: pwsh
         run: |
           $BundleDir = Join-Path $env:TEMP 'AppBundle'
           $DesktopPath = Join-Path $env:USERPROFILE 'Desktop'
@@ -257,11 +422,11 @@ jobs:
                           Expand-Archive -Path $TempZip -DestinationPath $DestPath -Force -ErrorAction Stop
                           Remove-Item $TempZip -Force
                           return $true
-                      } catch { Write-Warning "Failed: $Url"; if (Test-Path $TempZip) { Remove-Item $TempZip -Force } }
+                      } catch { if (Test-Path $TempZip) { Remove-Item $TempZip -Force } }
                   }
               }
               return $false
-          }
+          } 
           $File1 = Get-ChildItem -Path $BundleDir -Filter "Link ZIP_URL.txt" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($File1) {
               $DesktopExtract = Join-Path $env:TEMP 'DesktopFiles'
@@ -275,36 +440,51 @@ jobs:
               Download-And-Verify $File2.FullName $ThreeDir | Out-Null
           }
 
-      # 6. المتصفحات والكيرنل
+      # 6. تثبيت المتصفحات والكيرنل (NST Browser باستخدام SendKeys)
       - name: Browser & Kernel Setup
         continue-on-error: true
+        shell: pwsh
         run: |
           $BundleDir = Join-Path $env:TEMP 'AppBundle'
           $ThreeDir = Join-Path $env:TEMP 'THREE_EXTRACTED'
-
+          
+          # NST Browser - تثبيت تفاعلي باستخدام محاكاة المفاتيح
           $NstInst = Get-ChildItem -Path $BundleDir -Filter "*nst*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($NstInst) {
               Write-Host "Starting NST Browser installation with UI automation..."
               Start-Process -FilePath $NstInst.FullName
-              Start-Sleep -Seconds 5
+              Start-Sleep -Seconds 5 # انتظار نافذة اختيار اللغة
+              
               $wshell = New-Object -ComObject WScript.Shell
+              
+              # الصفحة 1: اختيار اللغة
               if ($wshell.AppActivate("Installer Language")) {
-                  $wshell.SendKeys("{ENTER}"); Start-Sleep -Seconds 3
-              }
-              if ($wshell.AppActivate("Nstbrowser Setup")) {
-                  $wshell.SendKeys("{ENTER}"); Start-Sleep -Seconds 2
-                  $wshell.SendKeys("{ENTER}"); Start-Sleep -Seconds 15
+                  Write-Host "Language window detected. Pressing OK..."
                   $wshell.SendKeys("{ENTER}")
+                  Start-Sleep -Seconds 3
+              }
+              
+              # الصفحة 2 و 3: خيارات التثبيت والمسار
+              if ($wshell.AppActivate("Nstbrowser Setup")) {
+                  Write-Host "Setup window detected. Pressing Next and Install..."
+                  $wshell.SendKeys("{ENTER}") # Next
+                  Start-Sleep -Seconds 2
+                  $wshell.SendKeys("{ENTER}") # Install
+                  Start-Sleep -Seconds 15 # انتظار انتهاء التثبيت
+                  $wshell.SendKeys("{ENTER}") # Finish
               }
               Write-Host "NST Browser installation completed."
+              
+              # استخراج الكيرنل
               $NstK = Get-ChildItem -Path $ThreeDir -Filter "nstchrome.zip" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
               if ($NstK) {
                   $NstDest = "C:\Users\runneradmin\.nst-agent\download\kernels\nstchrome"
                   New-Item -ItemType Directory -Path $NstDest -Force | Out-Null
                   Expand-Archive -Path $NstK.FullName -DestinationPath $NstDest -Force
               }
-          }
+          } 
 
+          # BitBrowser
           $BitInst = Get-ChildItem -Path $BundleDir -Filter "*BitBrowser*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($BitInst) {
               Start-Process -FilePath $BitInst.FullName -ArgumentList "/S", "/allusers", "/norestart" -Wait
@@ -314,42 +494,55 @@ jobs:
                   New-Item -ItemType Directory -Path $BitDest -Force | Out-Null
                   Expand-Archive -Path $BitK.FullName -DestinationPath $BitDest -Force
               }
-          }
+          } 
 
-      # 7. NoMachine
+      # 7. تثبيت NoMachine
       - name: Install NoMachine
         continue-on-error: true
+        shell: pwsh
         run: |
           $NmInstaller = Get-ChildItem -Path (Join-Path $env:TEMP 'AppBundle') -Filter "*nomachine*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($NmInstaller) { Start-Process -FilePath $NmInstaller.FullName -ArgumentList "/VERYSILENT", "/NORESTART" -Wait }
-          else { Write-Warning "NoMachine installer not found in bundle." }
 
-      # 8. العدّاد (بدون نوافذ منبثقة قد تعلّق الخطوة؛ التنبيهات تُكتب في السجل)
-      - name: Keep Session Alive
+      # 8. العداد الذكي مع إشعارات تفاعلية
+      - name: Keep Session Alive with Interactive Alerts
+        shell: pwsh
         run: |
           Write-Host "==== SETUP COMPLETED. STARTING TIMER ===="
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP | RustDesk: $env:TAILSCALE_IP`:21118 | RDP: $env:TAILSCALE_IP`:3389"
-          $end = (Get-Date).AddMinutes([int]$env:TIME_JOB)
-          $alerted = @(60, 30, 15, 5)
-          while ((Get-Date) -lt $end) {
-              $remaining = [math]::Ceiling(($end - (Get-Date)).TotalMinutes)
-              if ($remaining -in $alerted) {
-                  Write-Host "Session is running. $remaining minutes remaining."
-                  $alerted = $alerted | Where-Object { $_ -ne $remaining }
+          if ($env:TAILSCALE_OK -eq '1') {
+              Write-Host "Connect now -> RustDesk direct: $($env:TAILSCALE_IP):21118  |  RDP: $($env:TAILSCALE_IP):3389"
+          } else {
+              Write-Host "::warning::Tailscale is NOT connected in this run. Check the warnings above."
+          }
+          $KeepAliveMinutes = [int]$env:TIME_JOB
+          $startTime = Get-Date
+          $endTime = $startTime.AddMinutes($KeepAliveMinutes)
+          
+          $alertedTimes = @(60, 30, 15, 5)
+          Add-Type -AssemblyName PresentationFramework
+
+          Write-Host "Running custom timer for $KeepAliveMinutes minutes..."
+          
+          while ((Get-Date) -lt $endTime) {
+              $remaining = [math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
+              
+              if ($remaining -in $alertedTimes) {
+                  $msg = "Session is running. $remaining minutes remaining before file check."
+                  $title = "GitHub Actions Timer - $remaining Minutes Left"
+                  
+                  Write-Host "Showing interactive alert for $remaining minutes..."
+                  $result = [System.Windows.MessageBox]::Show($msg, $title, 'YesNo', 'Information')
+                  
+                  $alertedTimes = $alertedTimes | Where-Object { $_ -ne $remaining }
               }
+              
               Start-Sleep -Seconds 10
           }
+
           $StopFile = "C:\stop11stop.txt"
           if (Test-Path $StopFile) {
               Write-Host "File [$StopFile] FOUND. Waiting for GitHub forced timeout..."
-              while ($true) { Start-Sleep -Seconds 3600 }
+              while($true) { Start-Sleep -Seconds 3600 }
           } else {
-              Write-Host "File [$StopFile] NOT found. Closing now."
+              Write-Host "File [$StopFile] NOT found. Closing script now."
           }
-
-      - name: Cleanup
-        if: always()
-        run: |
-          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          if (Test-Path $ts) { & $ts logout }
-          exit 0
