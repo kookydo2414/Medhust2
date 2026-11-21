@@ -1,10 +1,10 @@
-name: AA_T121Win 11
+name: AA_Test_Win 11
 on:
   workflow_dispatch:
 
 jobs:
   deployment:
-    windows-latest
+    runs-on: windows-latest
     timeout-minutes: 800
     env:
       TIME_JOB: "340"
