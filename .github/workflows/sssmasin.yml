@@ -1,4 +1,4 @@
-name: AA_Test_Win 11
+name: AAAA_Test_Win 11
 on:
   workflow_dispatch:
 
@@ -12,6 +12,8 @@ jobs:
       aa3: "Zxxz4444"
       LINKS_LIST_URL: "https://tinyurl.com/ddaS441581"
       KEY_CHOICE: "1"
+      # "0" = اتصال Direct عبر Tailscale فقط | "1" = Direct + الـ ID العادي معاً
+      RUSTDESK_PUBLIC_ID: "1"
       PYTHONIOENCODING: "utf-8"
 
     steps:
@@ -25,6 +27,7 @@ jobs:
         run: |
           $HiderPath = 'C:\ProgramData\hide_agent.ps1'
           @'
+          param([switch]$Show)
           $src = @"
           using System;
           using System.Text;
@@ -36,7 +39,9 @@ jobs:
               [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
               [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
               [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
-              public static void Apply(bool show) {
+              // 0 = window not found, 1 = state had to be changed, 2 = already in the wanted state
+              public static int Apply(bool show) {
+                  int result = 0;
                   EnumWindows(delegate(IntPtr h, IntPtr l) {
                       StringBuilder t = new StringBuilder(512);
                       StringBuilder c = new StringBuilder(256);
@@ -48,23 +53,33 @@ jobs:
                       bool isAgent = title.IndexOf("hosted-compute-agent", StringComparison.OrdinalIgnoreCase) >= 0;
                       if (isConsole && isAgent) {
                           bool vis = IsWindowVisible(h);
-                          if (show && !vis) ShowWindow(h, 5);
-                          else if (!show && vis) ShowWindow(h, 0);
+                          if (show && !vis) { ShowWindow(h, 5); result = 1; }
+                          else if (!show && vis) { ShowWindow(h, 0); result = 1; }
+                          else if (result == 0) { result = 2; }
                       }
                       return true;
                   }, IntPtr.Zero);
+                  return result;
               }
           }
           "@
           Add-Type -TypeDefinition $src
+          if ($Show) { [WinHider]::Apply($true) | Out-Null; exit }
+          # يفحص فوراً ثم كل 100 ثانية. يتوقف بعد 9 فحوصات متتالية وجدها فيها مخفية أصلاً.
+          $hiddenStreak = 0
           while ($true) {
-              try { [WinHider]::Apply((Test-Path 'C:\show_agent.txt')) } catch {}
-              Start-Sleep -Seconds 1
+              $r = 0
+              try { $r = [WinHider]::Apply($false) } catch {}
+              if ($r -eq 2) { $hiddenStreak++ }
+              elseif ($r -eq 1) { $hiddenStreak = 0 }
+              if ($hiddenStreak -ge 9) { break }
+              Start-Sleep -Seconds 100
           }
           '@ | Set-Content -Path $HiderPath -Encoding UTF8
           Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $HiderPath
           Start-Sleep -Seconds 5
-          Write-Host "Agent console hider started (create C:\show_agent.txt to show the window again)."
+          Write-Host "Agent console hider started (checks every 100s, stops after 9 consecutive hidden checks)."
+          Write-Host "To show the window again run: powershell -File C:\ProgramData\hide_agent.ps1 -Show"
 
       # 1. إعداد النظام، المستخدمين، RDP (على شبكة Tailscale فقط)، وتغيير دقة الشاشة
       - name: System, RDP & Display Setup
@@ -255,12 +270,17 @@ jobs:
           New-NetFirewallRule -DisplayName 'RustDesk Tailnet Only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 21118 -RemoteAddress '100.64.0.0/10' -Program $rd -Profile Any | Out-Null
 
           $settings = [ordered]@{
-              'custom-rendezvous-server' = '127.0.0.1'
               'stop-service'             = 'N'
               'approve-mode'             = 'password'
               'verification-method'      = 'use-permanent-password'
               'direct-access-port'       = '21118'
               'direct-server'            = 'Y'
+          }
+          if ($env:RUSTDESK_PUBLIC_ID -eq '1') {
+              Write-Host "RustDesk public ID access: ENABLED (direct + ID)."
+          } else {
+              $settings['custom-rendezvous-server'] = '127.0.0.1'
+              Write-Host "RustDesk public ID access: DISABLED (direct via Tailscale only)."
           }
           $ready = $false
           for ($attempt = 1; $attempt -le 3; $attempt++) {
@@ -312,56 +332,6 @@ jobs:
           "RUSTDESK_OK=1" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "RUSTDESK_ID=$rdId" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "RustDesk direct-access listener is ready on port 21118 (Tailscale only)."
-
-      # 3.1 رفع بيانات RustDesk إلى Dropbox (مجلد connect_github)
-      - name: Upload RustDesk Info to Dropbox
-        continue-on-error: true
-        shell: python
-        run: |
-          import os, json, sys
-          from urllib.request import Request, urlopen
-          from urllib.parse import urlencode
-
-          if os.environ.get('RUSTDESK_OK') != '1':
-              print("::warning::RustDesk was not set up, nothing to upload.")
-              sys.exit(0)
-
-          run_id = os.environ.get('GITHUB_RUN_ID', '000000')
-          api_file = os.path.join(os.environ['TEMP'], 'AppBundle', 'drop_api.txt')
-          if not os.path.exists(api_file):
-              print(f"::warning::drop_api.txt not found at {api_file}. Skipping Dropbox upload.")
-              sys.exit(0)
-
-          creds = {}
-          with open(api_file, 'r', encoding='utf-8') as f:
-              for line in f:
-                  if '=' in line:
-                      k, v = line.strip().split('=', 1)
-                      creds[k.strip()] = v.strip()
-
-          data = urlencode({'grant_type': 'refresh_token', 'refresh_token': creds['refresh_token'], 'client_id': creds['client_id'], 'client_secret': creds['client_secret']}).encode('utf-8')
-          req = Request('https://api.dropboxapi.com/oauth2/token', data=data, method='POST')
-          with urlopen(req) as response:
-              access_token = json.loads(response.read().decode())['access_token']
-
-          def upload(file_path, dropbox_path):
-              api_arg = json.dumps({"path": dropbox_path, "mode": "overwrite"})
-              with open(file_path, 'rb') as f: file_data = f.read()
-              req = Request('https://content.dropboxapi.com/2/files/upload', data=file_data, method='POST')
-              req.add_header('Authorization', f'Bearer {access_token}')
-              req.add_header('Dropbox-API-Arg', api_arg)
-              req.add_header('Content-Type', 'application/octet-stream')
-              with urlopen(req) as response: print(f"Uploaded {dropbox_path}: {response.status}")
-
-          try:
-              fname = f"rustdesk_{run_id}.txt"
-              with open(fname, 'w', encoding='utf-8') as f:
-                  f.write(f"RustDesk ID (local only, public server disabled): {os.environ.get('RUSTDESK_ID', '')}\n")
-                  f.write("Direct access port: 21118 (via Tailscale)\n")
-                  f.write(f"Password: {os.environ.get('aa3', '')}\n")
-              upload(fname, f"/connect_github/{fname}")
-          except Exception as e:
-              print(f"::warning::RustDesk upload error: {e}")
 
       # 4. تثبيت Tailscale من الحزمة والاتصال بالمفتاح
       - name: Tailscale Setup
@@ -427,8 +397,8 @@ jobs:
           - RDP: **${ip}:3389** (user: runneradmin or $($env:aa2))
           "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      # 4.1 رفع بيانات Tailscale إلى Dropbox (مجلد connect_github)
-      - name: Upload Tailscale Info to Dropbox
+      # 4.1 رفع ملفي RustDesk وTailscale إلى Dropbox (مجلد connect_github)
+      - name: Upload RustDesk & Tailscale Info to Dropbox
         continue-on-error: true
         shell: python
         run: |
@@ -467,15 +437,44 @@ jobs:
               req.add_header('Content-Type', 'application/octet-stream')
               with urlopen(req) as response: print(f"Uploaded {dropbox_path}: {response.status}")
 
+          ip = os.environ.get('TAILSCALE_IP', '')
+          pw = os.environ.get('aa3', '')
+          rd_ok = os.environ.get('RUSTDESK_OK') == '1'
+          rd_id = os.environ.get('RUSTDESK_ID', '')
+
+          # ملف RustDesk: العنوان (IP:21118) ثم سطران فارغان ثم الـ ID
+          if rd_ok:
+              try:
+                  fname = f"rustdesk_{run_id}.txt"
+                  content = f"{ip}:21118"
+                  if rd_id and rd_id != 'unavailable':
+                      content += "\n\n\n" + rd_id
+                  with open(fname, 'w', encoding='utf-8') as f:
+                      f.write(content)
+                  upload(fname, f"/connect_github/{fname}")
+              except Exception as e:
+                  print(f"::warning::RustDesk upload error: {e}")
+          else:
+              print("::warning::RustDesk was not set up, skipping rustdesk file.")
+
+          # ملف Tailscale: كل البيانات
           try:
-              ip = os.environ.get('TAILSCALE_IP', '')
+              lines = [f"Tailscale IPv4: {ip}"]
+              if rd_ok:
+                  lines.append(f"RustDesk direct address: {ip}:21118")
+              lines.append(f"RDP address: {ip}:3389")
+              lines.append(f"Users: runneradmin / {os.environ.get('aa2', '')}")
+              lines.append(f"Password: {pw}")
+              if rd_ok:
+                  if os.environ.get('RUSTDESK_PUBLIC_ID') == '1':
+                      lines.append(f"RustDesk ID (works via public servers): {rd_id}")
+                  else:
+                      lines.append(f"RustDesk ID (local only, public server disabled): {rd_id}")
+                  lines.append("Direct access port: 21118 (via Tailscale)")
+                  lines.append(f"Password: {pw}")
               fname = f"tailscale_{run_id}.txt"
               with open(fname, 'w', encoding='utf-8') as f:
-                  f.write(f"Tailscale IPv4: {ip}\n")
-                  f.write(f"RustDesk direct address: {ip}:21118\n")
-                  f.write(f"RDP address: {ip}:3389\n")
-                  f.write(f"Users: runneradmin / {os.environ.get('aa2', '')}\n")
-                  f.write(f"Password: {os.environ.get('aa3', '')}\n")
+                  f.write("\n".join(lines) + "\n")
               upload(fname, f"/connect_github/{fname}")
           except Exception as e:
               print(f"::warning::Tailscale upload error: {e}")
